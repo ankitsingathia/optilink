@@ -1,0 +1,118 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The host build is the gate everything else depends on: it is what the
+  # Python and C# suites drive, so it runs first and on every platform the
+  # project claims to support.
+  host:
+    name: host build and tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    # bash everywhere, including Windows: the Makefile shells out to mkdir -p
+    # and rm -rf, which PowerShell does not provide.
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The Windows runner ships gcc but not make, so it has to be added
+      # before the Makefile is any use.
+      - name: Install make (Windows)
+        if: runner.os == 'Windows'
+        run: choco install make --no-progress -y
+
+      - name: Show the toolchain actually in use
+        run: |
+          gcc --version | head -1
+          make --version | head -1
+          python --version
+
+      - name: Install Python test dependencies
+        run: python -m pip install --upgrade pip -r requirements.txt
+
+      - name: Build for the host
+        run: make host
+
+      - name: C unit tests
+        run: make test
+
+      - name: Integration tests
+        run: python -m pytest tests/integration -v
+
+      - name: Traffic reconciliation
+        run: python tools/trafficgen.py --frames 5000 --corrupt-rate 0.15
+
+  # Sanitizers only on Linux: the MinGW and Apple toolchains do not ship the
+  # runtimes, and running them once on a platform that does is enough to find
+  # a bad index in the frame parser.
+  sanitizers:
+    name: address and undefined behaviour sanitizers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests under ASan and UBSan
+        run: make asan
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+
+  target:
+    name: cortex-m4 cross build and footprint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the ARM toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi
+
+      - name: Cross build
+        run: make arm
+
+      # Fails the build if the image outgrows the part, so a footprint
+      # regression lands on the commit that caused it.
+      - name: Footprint gate
+        run: make size-check
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: optilink-cortexm4
+          path: |
+            build/arm/optilink.elf
+            build/arm/optilink.map
+
+  tools:
+    name: linkmon telemetry validator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Build the host firmware for it to drive
+        run: make host
+
+      - name: Invariant self-test
+        run: dotnet run --project tools/LinkMon -- --self-test
