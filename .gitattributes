@@ -1,0 +1,9 @@
+# Normalise line endings. Without this a Windows checkout can commit CRLF into
+# the shell scripts, and a Linux CI runner then fails them with a "bad
+# interpreter" error that looks nothing like the actual cause.
+* text=auto eol=lf
+
+# Never touch these.
+*.png binary
+*.bin binary
+*.elf binary

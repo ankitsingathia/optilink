@@ -1,0 +1,21 @@
+build/
+*.o
+*.elf
+*.map
+*.bin
+*.hex
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# dotnet
+bin/
+obj/
+
+.vscode/
+.idea/
+*.swp
+.DS_Store

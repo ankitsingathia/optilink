@@ -1,0 +1,3 @@
+# Test dependencies. The firmware itself has none, and the harness uses only
+# the standard library, so this is pytest and nothing else.
+pytest>=8.0
