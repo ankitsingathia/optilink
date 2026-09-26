@@ -2,16 +2,18 @@
 
 Firmware for the controller inside a pluggable optical transceiver.
 
-It owns the CMIS management memory map the host reads over I2C, samples the
-module's analog monitors and compares them against alarm thresholds, runs the
-module and per-lane data path state machines that bring the optical link up
-and tear it down, and inspects Layer 2 frames on the management data path.
+It does four jobs:
+
+- keeps the CMIS management memory map that the host reads over I2C
+- samples the module's analog monitors and checks them against alarm thresholds
+- runs the module and per-lane data path state machines that bring the optical
+  link up and shut it down
+- inspects Layer 2 frames on the management data path
 
 The same C sources build two ways. `make arm` cross-compiles a Cortex-M4
-image; `make host` builds a desktop binary where the HAL is backed by ordinary
-memory and a pipe instead of silicon. Everything above the HAL is byte for
-byte identical between them, so the test suite exercises the code that ships
-rather than a reimplementation of it.
+image. `make host` builds a desktop binary where the HAL uses ordinary memory
+and a pipe instead of real hardware. All the code above the HAL is identical in
+both builds, so the tests run the same code that would ship.
 
 ```
 $ make test && make pytest
@@ -23,20 +25,19 @@ $ make test && make pytest
 
 ## Why it is built this way
 
-Firmware is usually tested badly because testing it properly needs hardware,
-and hardware is scarce, slow and shared. Three decisions here exist to avoid
-that.
+Firmware is hard to test well because proper testing needs hardware, and
+hardware is scarce, slow and shared. Three choices here work around that.
 
-**A HAL seam, not a mock layer.** `firmware/include/optilink/hal.h` is the
-only place that knows what the code is running on. Two files implement it:
-`hal_cortexm.c` drives real peripherals, `hal_host.c` fakes them. Nothing
-above the seam has a `#ifdef` in it. The alternative — mocking individual
-modules — would test the mocks.
+**One HAL boundary instead of many mocks.** `firmware/include/optilink/hal.h`
+is the only place that knows what the code is running on. Two files implement
+it: `hal_cortexm.c` drives real peripherals and `hal_host.c` fakes them. No
+code above the HAL has an `#ifdef`. Mocking each module separately would mostly
+test the mocks.
 
-**A virtual clock.** The host port's `hal_wait_for_tick()` only advances time
-when the test says so, via a `tick <n>` console command. So a test asking what
-happens 200 ms after a laser fault gets a deterministic answer instead of
-sleeping and hoping:
+**A virtual clock.** On the host build, `hal_wait_for_tick()` only moves time
+forward when the test tells it to, with a `tick <n>` console command. A test
+that asks what happens 200 ms after a laser fault gets the same answer every
+time, without sleeping:
 
 ```python
 live.inject("los", 1, 1)
@@ -46,14 +47,13 @@ live.tick(20)
 assert live.link()["lanes"][1]["state"] == "FAULT"       # and then trips
 ```
 
-That is the entire reason 54 integration tests run in 0.6 seconds and none of
-them are flaky.
+This is why the 54 integration tests run in 0.6 seconds and none of them are
+flaky.
 
-**Fault injection that cannot ship.** Every `hal_sim_*` entry point is behind
-`OPTILINK_HOST_SIM`, and the target build sets it to 0. A build that can be
-told to fake a laser fault is not a build that should reach a customer, and
-putting the seam at compile time makes that the linker's guarantee rather than
-something a reviewer has to notice.
+**Fault injection can't reach the real build.** Every `hal_sim_*` function is
+behind `OPTILINK_HOST_SIM`, which the target build sets to 0. A build that can
+be told to fake a laser fault should never reach a customer. Because this is
+decided at compile time, the linker enforces it, not a code reviewer.
 
 ---
 
@@ -85,8 +85,8 @@ something a reviewer has to notice.
              +-------------------------------------------------+
 ```
 
-Four periodic tasks, run to completion from one stack by a fixed-priority
-cooperative scheduler:
+A cooperative scheduler with fixed priorities runs four periodic tasks to
+completion on one stack:
 
 | task | period | priority | job |
 |------|--------|----------|-----|
@@ -95,9 +95,9 @@ cooperative scheduler:
 | `ddm`  | 100 ms | 2 | sample monitors, evaluate thresholds |
 | `cmis` | 100 ms | 3 | publish live values into the memory map |
 
-The console outranks the link because a module that will not answer its debug
-port is a module nobody can diagnose. The link task runs at 10 ms because the
-debounce is three samples and the qualification budget is 30 ms.
+The console has the highest priority because a module that doesn't answer on
+its debug port can't be diagnosed. The link task runs every 10 ms because the
+debounce is three samples and the link has 30 ms to qualify.
 
 ### The state machines
 
@@ -114,68 +114,66 @@ stateDiagram-v2
     READY --> RESET: module removed
 ```
 
-Underneath, each lane runs its own data path machine —
-`DEACTIVATED → INIT → TX_TURN_ON → ACTIVATED`, with `FAULT` reachable from
-any of them. Lanes are separate because they fail separately: one dirty fibre
-should dark one lane, not the other three.
+Below the module machine, each lane runs its own data path machine:
+`DEACTIVATED → INIT → TX_TURN_ON → ACTIVATED`, and any state can go to `FAULT`.
+Lanes are separate because they fail separately. One dirty fibre should turn
+off one lane, not all four.
 
 ---
 
-## Design decisions worth arguing about
+## Design decisions
 
-**Alarm flags latch and clear on read.** A laser that browns out for 40 ms and
-recovers must still be visible to a host polling once a second. Without
-latching the excursion is invisible and the link looks healthy right up until
-it fails. Read-to-clear is what real SFF-8636 and CMIS parts do, and it means
-`cmis_read()` cannot be a const operation.
+**Alarm flags latch and clear when read.** If a laser browns out for 40 ms and
+recovers, a host that polls once a second still needs to see it. Without
+latching, the dip is missed and the link looks healthy until it actually fails.
+Real SFF-8636 and CMIS parts clear flags on read too, which is why `cmis_read()`
+can't be a const function.
 
-**A faulted lane is darked immediately.** `lane_enter(DP_FAULT)` calls
-`hal_tx_enable(lane, false)` before anything else. A lit transmitter on a lane
-the firmware has already given up on is both a link hazard and an eye safety
-one. The C# validator checks this invariant on every reading.
+**A faulted lane is turned off straight away.** `lane_enter(DP_FAULT)` calls
+`hal_tx_enable(lane, false)` before anything else. Leaving a laser on for a
+lane the firmware has given up on is a risk to the link and to eye safety. The
+C# checker tests this on every reading.
 
-**Retries are capped, with a holdoff.** A lane that cannot come up settles in
-`FAULT` after five attempts instead of cycling its laser for the life of the
-system. A module that stays down and visible is more useful than one that
-flaps.
+**Retries are capped, with a wait between them.** A lane that can't come up
+stays in `FAULT` after five attempts instead of cycling its laser forever. A
+module that stays down, and says so, is easier to deal with than one that keeps
+flapping.
 
-**A missed period is counted, not replayed.** If the scheduler finds a task a
-full period late it runs it once, resyncs to now, and increments an overrun
-counter. Replaying the backlog would monopolise the loop and starve every task
-below it — the failure mode where one slow job takes the whole system down
-with it.
+**A missed period is counted, not made up.** If the scheduler finds a task a
+full period late, it runs it once, resets its timing to now, and adds one to an
+overrun counter. Running every missed period would hog the loop and starve the
+lower-priority tasks, so one slow job could take the whole system down.
 
-**The console owns no policy.** `cmd_frame` hands oversize frames to
-`eth_parse` rather than rejecting them itself, so the parser's reject path is
-reachable from outside and therefore testable. A console that duplicated the
-parser's length rule would have made that path dead code.
+**The console makes no decisions of its own.** `cmd_frame` passes oversize
+frames to `eth_parse` instead of rejecting them itself. That keeps the parser's
+reject path reachable from outside, so it can be tested. If the console had its
+own copy of the length rule, the parser's check could never be hit.
 
-**A nibble-wide CRC table.** The usual byte-wide CRC-32 table is 1 KB. Sixteen
-entries cost 64 bytes and still run about four times faster than the bit-wise
-loop. At the frame rates a management path sees, the small table is the right
-end of the trade.
+**A 16-entry CRC table.** The usual CRC-32 table has 256 entries and takes 1 KB.
+A 16-entry table (one per 4-bit nibble) takes 64 bytes and is still about four
+times faster than computing it bit by bit. For the frame rates a management
+path sees, the small table is the better trade.
 
 **No `printf`.** `uart_printf` is about 90 lines and supports `%c %s %d %u %x`
-with zero-padding and a width. Pulling in newlib's costs several kilobytes of
-flash and drags in `malloc`, neither of which belongs on a part whose entire
-job is a management console.
+with zero-padding and a width. newlib's `printf` costs several kilobytes of
+flash and pulls in `malloc`, and this chip only needs a management console.
 
 ---
 
 ## Testing
 
-Four layers, each catching what the others cannot.
+Four layers, each catching things the others can't.
 
 | layer | what it covers | run it |
 |-------|----------------|--------|
-| C unit tests | module logic in isolation — ring buffer wraparound, CRC vectors, threshold latching, scheduler overruns | `make test` |
-| Sanitizers | out-of-bounds and undefined behaviour in the frame parser, which walks attacker-shaped input | `make asan` |
-| Integration | the whole image running on a tick: bring-up timing, debounce, fault attribution, recovery, the memory map as a host sees it | `make pytest` |
-| Reconciliation | offered load against the device's own counters | `make traffic` |
+| C unit tests | module logic on its own: ring buffer wraparound, CRC test vectors, threshold latching, scheduler overruns | `make test` |
+| Sanitizers | out-of-bounds access and undefined behaviour in the frame parser, which has to handle hostile input | `make asan` |
+| Integration | the whole image running on the virtual clock: bring-up timing, debounce, which lane a fault is blamed on, recovery, and the memory map as a host sees it | `make pytest` |
+| Reconciliation | traffic sent compared with the device's own counters | `make traffic` |
 
-The reconciliation check is the one that finds parser bugs. Any generator can
-count what it transmitted; what catches a frame class the firmware silently
-drops is comparing that against the counters the device reports:
+Reconciliation is the check that finds parser bugs. Counting what a generator
+sent is easy. Comparing it with the counters the device reports is what shows
+up a kind of frame the firmware drops without saying so:
 
 ```
 $ python tools/trafficgen.py --frames 5000 --corrupt-rate 0.15
@@ -193,12 +191,11 @@ device counters:
 reconciled: device counters match what was sent
 ```
 
-`tools/LinkMon` is a C# console tool that renders the module's telemetry and
-checks a set of invariants against it — that the active-lane mask agrees with
-the per-lane states, that no faulted lane is still lit, that a module carrying
-an alarm is not advertised as ready. A dashboard that faithfully renders
-inconsistent telemetry is worse than no dashboard, because it lends authority
-to a wrong number.
+`tools/LinkMon` is a C# console tool that shows the module's telemetry and
+checks it for contradictions: the active-lane mask has to match the per-lane
+states, no faulted lane can still have its laser on, and a module with an alarm
+can't report itself as ready. A dashboard that displays contradictory
+telemetry without flagging it would make a wrong number look trustworthy.
 
 ```
 $ dotnet run --project tools/LinkMon -- --self-test
@@ -237,21 +234,20 @@ flash   10368 / 131072  [###.............................]   7.9%
 ram      8792 / 32768   [#########.......................]  26.8%
 ```
 
-Worth knowing where that RAM goes: the console line buffer is 3,200 bytes and
-the frame scratch is 1,590, so the debug console alone accounts for well over
-half of it. That is a deliberate trade — both exist so the parser and the
-command interface can be driven from outside with realistic inputs — but it is
-the first thing to shrink if this ever has to fit a smaller part.
+Most of that RAM is the debug console: the console line buffer is 3,200 bytes
+and the frame scratch buffer is 1,590. That's on purpose, because both let the
+parser and the command interface be driven from outside with realistic input.
+They would be the first thing to shrink for a smaller chip.
 
-Only a compiler and a linker script are required — no vendor HAL package, no
-CMSIS download. The register maps the port needs are declared in
+The target build only needs a compiler and a linker script. There is no vendor
+HAL package or CMSIS download. The registers the port uses are declared in
 `hal_cortexm.c`.
 
-CI runs the host build and tests on Linux, Windows and macOS, sanitizers and
-the cross build on Linux. `Jenkinsfile` mirrors it stage for stage, because
-firmware usually ends up building on the machine with the board attached
-rather than on a cloud runner. Both shell out to the same `make` targets, so
-there is one definition of what passing means.
+CI runs the host build and tests on Linux, Windows and macOS, and the
+sanitizers and cross build on Linux. The `Jenkinsfile` has the same stages,
+because firmware often ends up building on the machine the board is plugged
+into rather than a cloud runner. Both call the same `make` targets, so there is
+one definition of a passing build.
 
 ---
 
@@ -277,19 +273,18 @@ scripts/              environment setup, the full CI sequence, size gate
 ## Scope
 
 This runs against a simulated HAL. There is no physical transceiver, no real
-I2C bus and no real optics — the analog monitors are values in an array and
-the lane discretes are booleans a test sets.
+I2C bus and no real optics. The analog monitors are values in an array and the
+lane signals are booleans that a test sets.
 
-What that means in practice: the logic above the HAL is genuinely exercised,
-and the Cortex-M port compiles, links and fits its budget. What has **not**
-been proven is that port against real silicon — peripheral initialisation
-order, I2C clock stretching under a host that holds the bus, ADC settling
-time, whether the SysTick divisor matches the clock tree the board actually
-brings up. Those are exactly the things a simulated HAL cannot tell you, and
-it would be dishonest to claim otherwise. A clean cross-compile says the code
-is well-formed, not that it works.
+So the logic above the HAL is fully tested, and the Cortex-M port compiles,
+links and fits its memory budget. What has **not** been tested is that port on
+real silicon: the order peripherals are initialised in, I2C clock stretching
+when the host holds the bus, ADC settling time, and whether the SysTick divider
+matches the board's real clock setup. A simulated HAL can't answer those
+questions. A clean cross-compile shows the code builds, not that it works on
+hardware.
 
-The register maps, CMIS offsets, monitor scaling factors and threshold
-defaults are modelled on the real specifications. The memory map is a working
-subset — identity, module state, latched flags, module and per-lane monitors,
-thresholds and lane control — not the whole of CMIS 5.0.
+The register maps, CMIS offsets, monitor scaling and default thresholds follow
+the real specifications. The memory map is a working subset (identity, module
+state, latched flags, module and per-lane monitors, thresholds and lane
+control), not all of CMIS 5.0.
