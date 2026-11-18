@@ -21,6 +21,19 @@ $ make test && make pytest
 54 passed in 0.60s
 ```
 
+### Where to look
+
+| If you want to see | Open |
+|---|---|
+| The one place that knows the hardware | `firmware/include/optilink/hal.h`, `firmware/hal/hal_cortexm.c`, `firmware/hal/hal_host.c` |
+| Register-level drivers | `firmware/drivers/i2c.c` (I2C target), `firmware/drivers/uart.c` |
+| Startup code, interrupts and linker script | `firmware/hal/startup_cortexm.c`, `firmware/hal/cortexm_irq.h`, `firmware/hal/cortexm.ld` |
+| The scheduler and the ring buffer the console reads from | `firmware/src/sched.c`, `firmware/src/ringbuf.c` |
+| The CMIS memory map and alarm latching | `firmware/src/cmis.c`, `firmware/src/ddm.c` |
+| Debounce and the link state machines | `firmware/src/link.c` |
+| Unit tests (C) and integration tests (pytest) | `tests/unit/`, `tests/integration/` |
+| What has not been tested | [Scope](#scope) |
+
 ---
 
 ## Why it is built this way
